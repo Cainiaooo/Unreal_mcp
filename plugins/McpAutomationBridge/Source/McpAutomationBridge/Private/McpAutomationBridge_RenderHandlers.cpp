@@ -39,6 +39,16 @@ bool UMcpAutomationBridgeSubsystem::HandleRenderAction(const FString& RequestId,
     {
         FString Name;
         Payload->TryGetStringField(TEXT("name"), Name);
+        
+        // Validate required 'name' parameter - return error if missing or empty
+        if (Name.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, 
+                TEXT("name parameter is required for create_render_target"), 
+                TEXT("INVALID_ARGUMENT"));
+            return true;
+        }
+        
         int32 Width = 256;
         int32 Height = 256;
         Payload->TryGetNumberField(TEXT("width"), Width);
@@ -48,9 +58,40 @@ bool UMcpAutomationBridgeSubsystem::HandleRenderAction(const FString& RequestId,
 
         FString PackagePath = TEXT("/Game/RenderTargets");
         Payload->TryGetStringField(TEXT("packagePath"), PackagePath);
+        
+        // Also check for "path" as alias
+        if (PackagePath.IsEmpty() || PackagePath == TEXT("/Game/RenderTargets"))
+        {
+            FString PathAlias;
+            if (Payload->TryGetStringField(TEXT("path"), PathAlias) && !PathAlias.IsEmpty())
+            {
+                PackagePath = PathAlias;
+            }
+        }
 
-        FString AssetName = Name.IsEmpty() ? TEXT("NewRenderTarget") : Name;
+        // CRITICAL FIX: Use DoesAssetDirectoryExistOnDisk for strict validation
+        // UEditorAssetLibrary::DoesDirectoryExist() uses AssetRegistry cache which may
+        // contain stale entries. We need to check if the directory ACTUALLY exists on disk.
+        if (!DoesAssetDirectoryExistOnDisk(PackagePath))
+        {
+            SendAutomationError(RequestingSocket, RequestId, 
+                FString::Printf(TEXT("Parent folder does not exist: %s. Create the folder first or use an existing path."), *PackagePath), 
+                TEXT("PARENT_FOLDER_NOT_FOUND"));
+            return true;
+        }
+
+        FString AssetName = Name;
         FString FullPath = PackagePath / AssetName;
+
+        // CRITICAL FIX: Check if an asset already exists at this path
+        // This prevents "Cannot replace existing object of a different class" crash
+        if (UEditorAssetLibrary::DoesAssetExist(FullPath))
+        {
+            SendAutomationError(RequestingSocket, RequestId, 
+                FString::Printf(TEXT("Asset already exists at path: %s. Delete it first or use a different name."), *FullPath), 
+                TEXT("ASSET_ALREADY_EXISTS"));
+            return true;
+        }
 
         UPackage* Package = CreatePackage(*FullPath);
         UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(Package, UTextureRenderTarget2D::StaticClass(), FName(*AssetName), RF_Public | RF_Standalone);
@@ -125,7 +166,13 @@ bool UMcpAutomationBridgeSubsystem::HandleRenderAction(const FString& RequestId,
         {
             MID->SetTextureParameterValue(FName(*ParamName), RT);
             Volume->Settings.AddBlendable(MID, 1.0f);
-            SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Render target attached to volume via material."));
+            TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+            Result->SetStringField(TEXT("renderTarget"), TargetPath);
+            Result->SetStringField(TEXT("materialPath"), MaterialPath);
+            Result->SetStringField(TEXT("parameterName"), ParamName);
+            Result->SetBoolField(TEXT("attached"), true);
+            AddActorVerification(Result, Volume);
+            SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Render target attached to volume via material."), Result);
         }
         else
         {
@@ -164,8 +211,12 @@ bool UMcpAutomationBridgeSubsystem::HandleRenderAction(const FString& RequestId,
         }
 
         StaticMesh->Build(true);
-        
-        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Nanite enabled and mesh rebuilt."));
+
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetStringField(TEXT("assetPath"), AssetPath);
+        Result->SetBoolField(TEXT("naniteEnabled"), true);
+        Result->SetBoolField(TEXT("rebuilt"), true);
+        SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Nanite enabled and mesh rebuilt."), Result);
         return true;
     }
     else if (SubAction == TEXT("lumen_update_scene"))
@@ -178,7 +229,11 @@ bool UMcpAutomationBridgeSubsystem::HandleRenderAction(const FString& RequestId,
             if (World)
             {
                 GEngine->Exec(World, TEXT("r.Lumen.Scene.Recapture"));
-                SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Lumen scene recapture triggered."));
+                TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+                Result->SetStringField(TEXT("action"), TEXT("lumen_update_scene"));
+                Result->SetStringField(TEXT("command"), TEXT("r.Lumen.Scene.Recapture"));
+                Result->SetBoolField(TEXT("executed"), true);
+                SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Lumen scene recapture triggered."), Result);
                 return true;
             }
         }

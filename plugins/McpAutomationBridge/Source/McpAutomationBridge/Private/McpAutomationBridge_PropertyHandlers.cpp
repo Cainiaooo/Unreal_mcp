@@ -48,8 +48,31 @@ bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
     return true;
   }
 
-  UObject *RootObject = FindObject<UObject>(nullptr, *ObjectPath);
+  UObject *RootObject = nullptr;
 #if WITH_EDITOR
+  // CRITICAL FIX: Handle component paths in "ActorName.ComponentName" format
+  // This resolves paths like "TestActor.StaticMeshComponent0" to the actual component object
+  if (ObjectPath.Contains(TEXT(".")) && !ObjectPath.StartsWith(TEXT("/")))
+  {
+    FString ActorName = ObjectPath.Left(ObjectPath.Find(TEXT(".")));
+    FString ComponentName = ObjectPath.Right(ObjectPath.Len() - ActorName.Len() - 1);
+    
+    if (!ActorName.IsEmpty() && !ComponentName.IsEmpty())
+    {
+      // Try to find the actor first
+      if (AActor *Actor = FindActorByName(ActorName))
+      {
+        // Find the component on the actor using fuzzy name matching
+        if (UActorComponent *Comp = FindComponentByName(Actor, ComponentName))
+        {
+          RootObject = Comp;
+          // Normalize the path for downstream error messages
+          ObjectPath = Comp->GetPathName();
+        }
+      }
+    }
+  }
+  
   if (!RootObject) {
     if (AActor *FoundActor = FindActorByName(ObjectPath)) {
       RootObject = FoundActor;
@@ -57,6 +80,21 @@ bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
       ObjectPath = FoundActor->GetPathName();
     }
   }
+  if (!RootObject && ObjectPath.StartsWith(TEXT("/Game/"))) {
+    FString PackagePath = ObjectPath;
+    if (PackagePath.Contains(TEXT("."))) {
+      PackagePath = PackagePath.Left(PackagePath.Find(TEXT(".")));
+    }
+    UPackage* LoadedPackage = LoadPackage(nullptr, *PackagePath, LOAD_None);
+    if (LoadedPackage) {
+      RootObject = FindObject<UObject>(LoadedPackage, *ObjectPath);
+      if (!RootObject) {
+        RootObject = LoadedPackage;
+      }
+    }
+  }
+#else
+  RootObject = FindObject<UObject>(nullptr, *ObjectPath);
 #endif
   if (!RootObject) {
     SendAutomationError(
@@ -90,9 +128,9 @@ bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
       Actor->SetActorLocation(NewLoc);
 
       TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-      ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
       ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
       ResultPayload->SetBoolField(TEXT("saved"), true);
+      AddActorVerification(ResultPayload, Actor);
 
       TSharedPtr<FJsonObject> ValObj = MakeShared<FJsonObject>();
       ValObj->SetNumberField(TEXT("x"), NewLoc.X);
@@ -126,9 +164,9 @@ bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
       Actor->SetActorRotation(NewRot);
 
       TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-      ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
       ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
       ResultPayload->SetBoolField(TEXT("saved"), true);
+      AddActorVerification(ResultPayload, Actor);
 
       TSharedPtr<FJsonObject> ValObj = MakeShared<FJsonObject>();
       ValObj->SetNumberField(TEXT("pitch"), NewRot.Pitch);
@@ -164,9 +202,9 @@ bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
       Actor->SetActorScale3D(NewScale);
 
       TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-      ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
       ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
       ResultPayload->SetBoolField(TEXT("saved"), true);
+      AddActorVerification(ResultPayload, Actor);
 
       TSharedPtr<FJsonObject> ValObj = MakeShared<FJsonObject>();
       ValObj->SetNumberField(TEXT("x"), NewScale.X);
@@ -189,10 +227,10 @@ bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
       Actor->SetActorHiddenInGame(bHidden);
 
       TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-      ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
       ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
       ResultPayload->SetBoolField(TEXT("saved"), true);
       ResultPayload->SetBoolField(TEXT("value"), bHidden);
+      AddActorVerification(ResultPayload, Actor);
 
       SendAutomationResponse(RequestingSocket, RequestId, true,
                              TEXT("Actor visibility updated."), ResultPayload,
@@ -258,9 +296,15 @@ bool UMcpAutomationBridgeSubsystem::HandleSetObjectProperty(
 #endif
 
   TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-  ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
   ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
   ResultPayload->SetBoolField(TEXT("saved"), true);
+  
+  // Add verification based on object type
+  if (AActor* AsActor = Cast<AActor>(RootObject)) {
+    AddActorVerification(ResultPayload, AsActor);
+  } else {
+    AddAssetVerification(ResultPayload, RootObject);
+  }
 
   if (TSharedPtr<FJsonValue> CurrentValue =
           ExportPropertyToJsonValue(TargetContainer, Property)) {
@@ -309,8 +353,31 @@ bool UMcpAutomationBridgeSubsystem::HandleGetObjectProperty(
     return true;
   }
 
-  UObject *RootObject = FindObject<UObject>(nullptr, *ObjectPath);
+  UObject *RootObject = nullptr;
 #if WITH_EDITOR
+  // CRITICAL FIX: Handle component paths in "ActorName.ComponentName" format
+  // This resolves paths like "TestActor.StaticMeshComponent0" to the actual component object
+  if (ObjectPath.Contains(TEXT(".")) && !ObjectPath.StartsWith(TEXT("/")))
+  {
+    FString ActorName = ObjectPath.Left(ObjectPath.Find(TEXT(".")));
+    FString ComponentName = ObjectPath.Right(ObjectPath.Len() - ActorName.Len() - 1);
+    
+    if (!ActorName.IsEmpty() && !ComponentName.IsEmpty())
+    {
+      // Try to find the actor first
+      if (AActor *Actor = FindActorByName(ActorName))
+      {
+        // Find the component on the actor using fuzzy name matching
+        if (UActorComponent *Comp = FindComponentByName(Actor, ComponentName))
+        {
+          RootObject = Comp;
+          // Normalize the path for downstream error messages
+          ObjectPath = Comp->GetPathName();
+        }
+      }
+    }
+  }
+  
   if (!RootObject) {
     if (AActor *FoundActor = FindActorByName(ObjectPath)) {
       RootObject = FoundActor;
@@ -318,6 +385,21 @@ bool UMcpAutomationBridgeSubsystem::HandleGetObjectProperty(
       ObjectPath = FoundActor->GetPathName();
     }
   }
+  if (!RootObject && ObjectPath.StartsWith(TEXT("/Game/"))) {
+    FString PackagePath = ObjectPath;
+    if (PackagePath.Contains(TEXT("."))) {
+      PackagePath = PackagePath.Left(PackagePath.Find(TEXT(".")));
+    }
+    UPackage* LoadedPackage = LoadPackage(nullptr, *PackagePath, LOAD_None);
+    if (LoadedPackage) {
+      RootObject = FindObject<UObject>(LoadedPackage, *ObjectPath);
+      if (!RootObject) {
+        RootObject = LoadedPackage;
+      }
+    }
+  }
+#else
+  RootObject = FindObject<UObject>(nullptr, *ObjectPath);
 #endif
   if (!RootObject) {
     SendAutomationError(
@@ -330,11 +412,11 @@ bool UMcpAutomationBridgeSubsystem::HandleGetObjectProperty(
   // Special handling for common AActor properties that are actually functions
   // or require setters
   if (AActor *Actor = Cast<AActor>(RootObject)) {
-    if (PropertyName.Equals(TEXT("ActorLocation"), ESearchCase::IgnoreCase)) {
+ if (PropertyName.Equals(TEXT("ActorLocation"), ESearchCase::IgnoreCase)) {
       FVector Loc = Actor->GetActorLocation();
       TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-      ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
       ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
+      AddActorVerification(ResultPayload, Actor);
 
       TSharedPtr<FJsonObject> ValObj = MakeShared<FJsonObject>();
       ValObj->SetNumberField(TEXT("x"), Loc.X);
@@ -351,8 +433,8 @@ bool UMcpAutomationBridgeSubsystem::HandleGetObjectProperty(
                                    ESearchCase::IgnoreCase)) {
       FRotator Rot = Actor->GetActorRotation();
       TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-      ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
       ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
+      AddActorVerification(ResultPayload, Actor);
 
       TSharedPtr<FJsonObject> ValObj = MakeShared<FJsonObject>();
       ValObj->SetNumberField(TEXT("pitch"), Rot.Pitch);
@@ -371,8 +453,8 @@ bool UMcpAutomationBridgeSubsystem::HandleGetObjectProperty(
                                    ESearchCase::IgnoreCase)) {
       FVector Scale = Actor->GetActorScale3D();
       TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-      ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
       ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
+      AddActorVerification(ResultPayload, Actor);
 
       TSharedPtr<FJsonObject> ValObj = MakeShared<FJsonObject>();
       ValObj->SetNumberField(TEXT("x"), Scale.X);
@@ -429,10 +511,16 @@ bool UMcpAutomationBridgeSubsystem::HandleGetObjectProperty(
     return true;
   }
 
-  TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-  ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
+TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
   ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
   ResultPayload->SetField(TEXT("value"), CurrentValue);
+  
+  // Add verification based on object type
+  if (AActor* AsActor = Cast<AActor>(RootObject)) {
+    AddActorVerification(ResultPayload, AsActor);
+  } else {
+    AddAssetVerification(ResultPayload, RootObject);
+  }
 
   SendAutomationResponse(RequestingSocket, RequestId, true,
                          TEXT("Property value retrieved."), ResultPayload,
@@ -580,11 +668,17 @@ bool UMcpAutomationBridgeSubsystem::HandleArrayAppend(
   RootObject->PostEditChange();
 #endif
 
-  TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-  ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
+TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
   ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
   ResultPayload->SetNumberField(TEXT("newIndex"), NewIndex);
   ResultPayload->SetNumberField(TEXT("newSize"), Helper.Num());
+  
+  // Add verification based on object type
+  if (AActor* AsActor = Cast<AActor>(RootObject)) {
+    AddActorVerification(ResultPayload, AsActor);
+  } else {
+    AddAssetVerification(ResultPayload, RootObject);
+  }
 
   SendAutomationResponse(RequestingSocket, RequestId, true,
                          TEXT("Array element appended."), ResultPayload,
@@ -689,11 +783,17 @@ bool UMcpAutomationBridgeSubsystem::HandleArrayRemove(
   RootObject->PostEditChange();
 #endif
 
-  TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-  ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
+TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
   ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
   ResultPayload->SetNumberField(TEXT("removedIndex"), Index);
   ResultPayload->SetNumberField(TEXT("newSize"), Helper.Num());
+  
+  // Add verification based on object type
+  if (AActor* AsActor = Cast<AActor>(RootObject)) {
+    AddActorVerification(ResultPayload, AsActor);
+  } else {
+    AddAssetVerification(ResultPayload, RootObject);
+  }
 
   SendAutomationResponse(RequestingSocket, RequestId, true,
                          TEXT("Array element removed."), ResultPayload,
@@ -782,11 +882,17 @@ bool UMcpAutomationBridgeSubsystem::HandleArrayClear(
   RootObject->PostEditChange();
 #endif
 
-  TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
-  ResultPayload->SetStringField(TEXT("objectPath"), ObjectPath);
+TSharedPtr<FJsonObject> ResultPayload = MakeShared<FJsonObject>();
   ResultPayload->SetStringField(TEXT("propertyName"), PropertyName);
   ResultPayload->SetNumberField(TEXT("previousSize"), PrevSize);
   ResultPayload->SetNumberField(TEXT("newSize"), 0);
+  
+  // Add verification based on object type
+  if (AActor* AsActor = Cast<AActor>(RootObject)) {
+    AddActorVerification(ResultPayload, AsActor);
+  } else {
+    AddAssetVerification(ResultPayload, RootObject);
+  }
 
   SendAutomationResponse(RequestingSocket, RequestId, true,
                          TEXT("Array cleared."), ResultPayload, FString());
@@ -1941,10 +2047,10 @@ bool UMcpAutomationBridgeSubsystem::HandleMapClear(
     }
   }
 
-  FSetProperty *SetProp = CastField<FSetProperty>(Property);
-  if (!SetProp) {
+  FMapProperty *MapProp = CastField<FMapProperty>(Property);
+  if (!MapProp) {
     SendAutomationError(RequestingSocket, RequestId,
-                        TEXT("Property is not a set."), TEXT("NOT_A_SET"));
+                        TEXT("Property is not a map."), TEXT("NOT_A_MAP"));
     return true;
   }
 
@@ -1952,10 +2058,10 @@ bool UMcpAutomationBridgeSubsystem::HandleMapClear(
   RootObject->Modify();
 #endif
 
-  FScriptSetHelper Helper(
-      SetProp, SetProp->ContainerPtrToValuePtr<void>(TargetContainer));
+  FScriptMapHelper Helper(
+      MapProp, MapProp->ContainerPtrToValuePtr<void>(TargetContainer));
   const int32 PrevSize = Helper.Num();
-  Helper.EmptyElements();
+  Helper.EmptyValues();
 
 #if WITH_EDITOR
   RootObject->PostEditChange();
@@ -2511,8 +2617,12 @@ bool UMcpAutomationBridgeSubsystem::HandleGetAssetReferences(
   IAssetRegistry &AssetRegistry = AssetRegistryModule.Get();
 
   // Find the asset
-  FAssetData AssetData =
-      AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(AssetPath));
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+  FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(AssetPath));
+#else
+  // UE 5.0: GetAssetByObjectPath takes FName
+  FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FName(*AssetPath));
+#endif
   if (!AssetData.IsValid()) {
     SendAutomationError(
         RequestingSocket, RequestId,
@@ -2588,8 +2698,12 @@ bool UMcpAutomationBridgeSubsystem::HandleGetAssetDependencies(
   IAssetRegistry &AssetRegistry = AssetRegistryModule.Get();
 
   // Find the asset
-  FAssetData AssetData =
-      AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(AssetPath));
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+  FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(AssetPath));
+#else
+  // UE 5.0: GetAssetByObjectPath takes FName
+  FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FName(*AssetPath));
+#endif
   if (!AssetData.IsValid()) {
     SendAutomationError(
         RequestingSocket, RequestId,

@@ -14,6 +14,11 @@
 #include "Misc/EngineVersionComparison.h"
 
 #if WITH_EDITOR
+// UE 5.0 deprecation warning suppression - BlendSpaceBase.h is deprecated but transitively included by engine headers
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 0
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
 #include "Animation/AnimSequence.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimBlueprint.h"
@@ -24,6 +29,9 @@
 #include "Animation/AimOffsetBlendSpace.h"
 #include "Animation/AnimNotifies/AnimNotify.h"
 #include "Animation/AnimNotifies/AnimNotifyState.h"
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 0
+#pragma warning(pop)
+#endif
 #include "Engine/SkeletalMesh.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
@@ -59,12 +67,21 @@
 #define MCP_HAS_CONTROLRIG_BLUEPRINT 0
 #endif
 
+// RigVM Blueprint Generated Class (needed for ControlRig creation fallback in UE 5.1-5.4)
+#if __has_include("RigVMBlueprintGeneratedClass.h")
+#include "RigVMBlueprintGeneratedClass.h"
+#endif
+
+// UE 5.0 uses UControlRigBlueprintGeneratedClass (different name from UE 5.1+)
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 0
+#include "ControlRigBlueprintGeneratedClass.h"
+#endif
+
 // Control Rig Factory (for creating Control Rig assets)
-#if __has_include("ControlRigBlueprintFactory.h")
-#include "ControlRigBlueprintFactory.h"
-#define MCP_HAS_CONTROLRIG_FACTORY 1
-#else
-#define MCP_HAS_CONTROLRIG_FACTORY 0
+// Note: ControlRigBlueprintFactory header is Public only in UE 5.5+
+// For UE 5.1-5.4 we use a fallback implementation
+#if MCP_HAS_CONTROLRIG_FACTORY && ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+  #include "ControlRigBlueprintFactory.h"
 #endif
 
 // IK Rig support (UE 5.0+)
@@ -427,22 +444,26 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         // Set sequence length
         float Duration = static_cast<float>(NumFrames) / static_cast<float>(FrameRate);
         
-#if ENGINE_MAJOR_VERSION >= 5
-        // UE 5.7+: Use SetNumberOfFrames with FFrameNumber instead of deprecated SetPlayLength
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
+        // UE 5.1+: Use SetNumberOfFrames with FFrameNumber
         NewSequence->GetController().SetFrameRate(FFrameRate(FrameRate, 1));
         NewSequence->GetController().SetNumberOfFrames(FFrameNumber(NumFrames));
 #else
+        // SequenceLength is deprecated in UE 5.1+ but needed for UE 5.0 compatibility
+        PRAGMA_DISABLE_DEPRECATION_WARNINGS
         NewSequence->SequenceLength = Duration;
+        PRAGMA_ENABLE_DEPRECATION_WARNINGS
 #endif
         
         SaveAnimAsset(NewSequence, bSave);
-        
+
         FString FullPath = Path / Name;
         Response->SetStringField(TEXT("assetPath"), FullPath);
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Animation sequence '%s' created"), *Name));
+        AddAssetVerification(Response, NewSequence);
         return Response;
     }
-    
+
     if (SubAction == TEXT("set_sequence_length"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -458,8 +479,8 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         
         float Duration = static_cast<float>(NumFrames) / static_cast<float>(FrameRate);
         
-#if ENGINE_MAJOR_VERSION >= 5
-        // UE 5.7+: Use SetNumberOfFrames with FFrameNumber instead of deprecated SetPlayLength
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
+        // UE 5.1+: Use SetNumberOfFrames with FFrameNumber
         Sequence->GetController().SetFrameRate(FFrameRate(FrameRate, 1));
         Sequence->GetController().SetNumberOfFrames(FFrameNumber(NumFrames));
         if (Params->HasField(TEXT("frameRate")))
@@ -467,15 +488,19 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
             // Frame rate already set above
         }
 #else
+        // SequenceLength is deprecated in UE 5.1+ but needed for UE 5.0 compatibility
+        PRAGMA_DISABLE_DEPRECATION_WARNINGS
         Sequence->SequenceLength = Duration;
+        PRAGMA_ENABLE_DEPRECATION_WARNINGS
 #endif
         
         SaveAnimAsset(Sequence, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Sequence length updated"));
+        AddAssetVerification(Response, Sequence);
         return Response;
     }
-    
+
     if (SubAction == TEXT("add_bone_track"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -493,15 +518,29 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
             ANIM_ERROR_RESPONSE(FString::Printf(TEXT("Could not load animation sequence: %s"), *AssetPath), TEXT("SEQUENCE_NOT_FOUND"));
         }
         
-#if ENGINE_MAJOR_VERSION >= 5
-        // UE5 uses IAnimationDataController
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
+        // UE 5.1+ uses IAnimationDataController with IsValidBoneTrackName and AddBoneCurve
         IAnimationDataController& Controller = Sequence->GetController();
         FName BoneFName(*BoneName);
         
-        // Add bone track if it doesn't exist - UE 5.7+ uses IsValidBoneTrackName instead of deprecated FindBoneTrackByName
         if (!Controller.GetModel()->IsValidBoneTrackName(BoneFName))
         {
             Controller.AddBoneCurve(BoneFName);
+        }
+#elif ENGINE_MAJOR_VERSION >= 5
+        // UE 5.0 approach - uses FindBoneTrackByName which returns a pointer
+        IAnimationDataController& Controller = Sequence->GetController();
+        FName BoneFName(*BoneName);
+        
+        const FBoneAnimationTrack* Track = Controller.GetModel()->FindBoneTrackByName(BoneFName);
+        if (Track == nullptr)
+        {
+            // UE 5.0 doesn't have AddBoneCurve - use AddNewRawTrack directly on the sequence
+            // AddNewRawTrack is deprecated in UE 5.1+ but needed for UE 5.0 compatibility
+            PRAGMA_DISABLE_DEPRECATION_WARNINGS
+            FRawAnimSequenceTrack NewTrack;
+            Sequence->AddNewRawTrack(BoneFName, &NewTrack);
+            PRAGMA_ENABLE_DEPRECATION_WARNINGS
         }
 #else
         // UE4 approach
@@ -510,17 +549,21 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         if (TrackIndex == INDEX_NONE)
         {
             // Add raw track
+            // AddNewRawTrack is deprecated in UE 5.1+ but needed for UE 4.x compatibility
+            PRAGMA_DISABLE_DEPRECATION_WARNINGS
             FRawAnimSequenceTrack NewTrack;
             Sequence->AddNewRawTrack(BoneFName, &NewTrack);
+            PRAGMA_ENABLE_DEPRECATION_WARNINGS
         }
 #endif
         
         SaveAnimAsset(Sequence, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Bone track '%s' added"), *BoneName));
+        AddAssetVerification(Response, Sequence);
         return Response;
     }
-    
+
     if (SubAction == TEXT("set_bone_key"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -543,11 +586,11 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
             ANIM_ERROR_RESPONSE(FString::Printf(TEXT("Could not load animation sequence: %s"), *AssetPath), TEXT("SEQUENCE_NOT_FOUND"));
         }
         
-#if ENGINE_MAJOR_VERSION >= 5
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
+        // UE 5.1+ API
         IAnimationDataController& Controller = Sequence->GetController();
         FName BoneFName(*BoneName);
         
-        // Ensure bone track exists - UE 5.7+ uses IsValidBoneTrackName instead of deprecated FindBoneTrackByName
         if (!Controller.GetModel()->IsValidBoneTrackName(BoneFName))
         {
             Controller.AddBoneCurve(BoneFName);
@@ -563,14 +606,37 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         // Set key at frame
         FFrameNumber FrameNumber(Frame);
         Controller.SetBoneTrackKeys(BoneFName, {Location}, {Rotation}, {Scale});
+#elif ENGINE_MAJOR_VERSION >= 5
+        // UE 5.0 API - uses FindBoneTrackByName which returns a pointer
+        IAnimationDataController& Controller = Sequence->GetController();
+        FName BoneFName(*BoneName);
+        
+        const FBoneAnimationTrack* Track = Controller.GetModel()->FindBoneTrackByName(BoneFName);
+        if (Track == nullptr)
+        {
+            // UE 5.0 doesn't have AddBoneCurve - use AddNewRawTrack
+            // AddNewRawTrack is deprecated in UE 5.1+ but needed for UE 5.0 compatibility
+            PRAGMA_DISABLE_DEPRECATION_WARNINGS
+            FRawAnimSequenceTrack NewTrack;
+            Sequence->AddNewRawTrack(BoneFName, &NewTrack);
+            PRAGMA_ENABLE_DEPRECATION_WARNINGS
+        }
+        
+        FVector Location = LocationObj.IsValid() ? GetVectorFromJsonAnim(LocationObj) : FVector::ZeroVector;
+        FQuat Rotation = RotationObj.IsValid() ? GetRotatorFromJsonAnim(RotationObj).Quaternion() : FQuat::Identity;
+        FVector Scale = ScaleObj.IsValid() ? GetVectorFromJsonAnim(ScaleObj) : FVector::OneVector;
+        
+        FFrameNumber FrameNumber(Frame);
+        Controller.SetBoneTrackKeys(BoneFName, {Location}, {Rotation}, {Scale});
 #endif
         
         SaveAnimAsset(Sequence, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Bone key set at frame %d"), Frame));
+        AddAssetVerification(Response, Sequence);
         return Response;
     }
-    
+
     if (SubAction == TEXT("set_curve_key"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -591,10 +657,19 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
             ANIM_ERROR_RESPONSE(FString::Printf(TEXT("Could not load animation sequence: %s"), *AssetPath), TEXT("SEQUENCE_NOT_FOUND"));
         }
         
-#if ENGINE_MAJOR_VERSION >= 5
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+        // UE 5.3+ API - FAnimationCurveIdentifier takes FName directly
         IAnimationDataController& Controller = Sequence->GetController();
         FAnimationCurveIdentifier CurveId(FName(*CurveName), ERawCurveTrackTypes::RCT_Float);
-        
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+        // UE 5.1-5.2 API - FAnimationCurveIdentifier takes FSmartName
+        IAnimationDataController& Controller = Sequence->GetController();
+        FSmartName SmartCurveName;
+        SmartCurveName.DisplayName = FName(*CurveName);
+        FAnimationCurveIdentifier CurveId(SmartCurveName, ERawCurveTrackTypes::RCT_Float);
+#endif
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
         // Find or create curve
         const FFloatCurve* ExistingCurve = Sequence->GetDataModel()->FindFloatCurve(CurveId);
         if (!ExistingCurve && bCreateIfMissing)
@@ -608,11 +683,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
 #endif
         
         SaveAnimAsset(Sequence, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Curve key set at frame %d"), Frame));
+        AddAssetVerification(Response, Sequence);
         return Response;
     }
-    
+
     if (SubAction == TEXT("add_notify"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -635,7 +711,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
             FullClassName = TEXT("AnimNotify_") + NotifyClass;
         }
         
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
         UClass* NotifyUClass = FindFirstObject<UClass>(*FullClassName, EFindFirstObjectOptions::ExactClass);
+#else
+        // UE 5.0: Use ResolveClassByName instead of deprecated ANY_PACKAGE
+        UClass* NotifyUClass = ResolveClassByName(FullClassName);
+#endif
         if (!NotifyUClass)
         {
             NotifyUClass = UAnimNotify::StaticClass();
@@ -669,11 +750,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(AnimAsset, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Notify added"));
+        AddAssetVerification(Response, AnimAsset);
         return Response;
     }
-    
+
     if (SubAction == TEXT("add_notify_state"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -697,7 +779,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
             FullClassName = TEXT("AnimNotifyState_") + NotifyClass;
         }
         
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
         UClass* NotifyStateClass = FindFirstObject<UClass>(*FullClassName, EFindFirstObjectOptions::ExactClass);
+#else
+        // UE 5.0: Use ResolveClassByName instead of deprecated ANY_PACKAGE
+        UClass* NotifyStateClass = ResolveClassByName(FullClassName);
+#endif
         if (!NotifyStateClass)
         {
             NotifyStateClass = UAnimNotifyState::StaticClass();
@@ -734,11 +821,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(AnimAsset, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Notify state added"));
+        AddAssetVerification(Response, AnimAsset);
         return Response;
     }
-    
+
     if (SubAction == TEXT("add_sync_marker"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -773,11 +861,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         Sequence->RefreshSyncMarkerDataFromAuthored();
         
         SaveAnimAsset(Sequence, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Sync marker '%s' added"), *MarkerName));
+        AddAssetVerification(Response, Sequence);
         return Response;
     }
-    
+
     if (SubAction == TEXT("set_root_motion_settings"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -810,11 +899,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(Sequence, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Root motion settings updated"));
+        AddAssetVerification(Response, Sequence);
         return Response;
     }
-    
+
     if (SubAction == TEXT("set_additive_settings"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -870,11 +960,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(Sequence, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Additive settings updated"));
+        AddAssetVerification(Response, Sequence);
         return Response;
     }
-    
+
     // ===== 10.2 Animation Montages =====
     
     if (SubAction == TEXT("create_montage"))
@@ -923,13 +1014,14 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(NewMontage, bSave);
-        
+
         FString FullPath = Path / Name;
         Response->SetStringField(TEXT("assetPath"), FullPath);
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Montage '%s' created"), *Name));
+        AddAssetVerification(Response, NewMontage);
         return Response;
     }
-    
+
     if (SubAction == TEXT("add_montage_section"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -952,11 +1044,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         int32 SectionIndex = Montage->AddAnimCompositeSection(FName(*SectionName), StartTime);
         
         SaveAnimAsset(Montage, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Section '%s' added at index %d"), *SectionName, SectionIndex));
+        AddAssetVerification(Response, Montage);
         return Response;
     }
-    
+
     if (SubAction == TEXT("add_montage_slot"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -996,7 +1089,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         
         // Add animation to slot track
         FAnimSegment& Segment = SlotTrack->AnimTrack.AnimSegments.AddDefaulted_GetRef();
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
         Segment.SetAnimReference(Animation);
+#else
+        // UE 5.0: Direct member access
+        Segment.AnimReference = Animation;
+#endif
         Segment.StartPos = StartTime;
         Segment.AnimStartTime = 0.0f;
         Segment.AnimEndTime = Animation->GetPlayLength();
@@ -1004,11 +1102,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         Segment.LoopingCount = 1;
         
         SaveAnimAsset(Montage, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Animation added to montage slot"));
+        AddAssetVerification(Response, Montage);
         return Response;
     }
-    
+
     if (SubAction == TEXT("set_section_timing"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -1041,11 +1140,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(Montage, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Section timing updated"));
+        AddAssetVerification(Response, Montage);
         return Response;
     }
-    
+
     if (SubAction == TEXT("add_montage_notify"))
     {
         // Similar to add_notify but for montages
@@ -1069,7 +1169,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
             FullClassName = TEXT("AnimNotify_") + NotifyClass;
         }
         
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 1
         UClass* NotifyUClass = FindFirstObject<UClass>(*FullClassName, EFindFirstObjectOptions::ExactClass);
+#else
+        // UE 5.0: Use ResolveClassByName instead of deprecated ANY_PACKAGE
+        UClass* NotifyUClass = ResolveClassByName(FullClassName);
+#endif
         if (!NotifyUClass)
         {
             NotifyUClass = UAnimNotify::StaticClass();
@@ -1093,11 +1198,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(Montage, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Montage notify added"));
+        AddAssetVerification(Response, Montage);
         return Response;
     }
-    
+
     if (SubAction == TEXT("set_blend_in"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -1128,11 +1234,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(Montage, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Blend in settings updated"));
+        AddAssetVerification(Response, Montage);
         return Response;
     }
-    
+
     if (SubAction == TEXT("set_blend_out"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -1163,11 +1270,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(Montage, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(TEXT("Blend out settings updated"));
+        AddAssetVerification(Response, Montage);
         return Response;
     }
-    
+
     if (SubAction == TEXT("link_sections"))
     {
         FString AssetPath = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -1195,11 +1303,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         }
         
         SaveAnimAsset(Montage, bSave);
-        
+
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Linked '%s' to '%s'"), *FromSection, *ToSection));
+        AddAssetVerification(Response, Montage);
         return Response;
     }
-    
+
     // ===== 10.3 Blend Spaces =====
     
     if (SubAction == TEXT("create_blend_space_1d"))
@@ -1266,16 +1375,17 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         NewBlendSpace->PostEditChange();
         
         SaveAnimAsset(NewBlendSpace, bSave);
-        
+
         FString FullPath = Path / Name;
         Response->SetStringField(TEXT("assetPath"), FullPath);
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Blend Space 1D '%s' created"), *Name));
+        AddAssetVerification(Response, NewBlendSpace);
 #else
         ANIM_ERROR_RESPONSE(TEXT("Blend space factory not available"), TEXT("NOT_SUPPORTED"));
 #endif
         return Response;
     }
-    
+
     if (SubAction == TEXT("create_blend_space_2d"))
     {
 #if MCP_HAS_BLENDSPACE_FACTORY
@@ -2245,7 +2355,9 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
     
     if (SubAction == TEXT("create_control_rig"))
     {
-#if MCP_HAS_CONTROLRIG_FACTORY && MCP_HAS_CONTROLRIG_BLUEPRINT
+// ControlRig factory static methods (CreateNewControlRigAsset, CreateControlRigFromSkeletalMeshOrSkeleton)
+// are only available in UE 5.5+ where ControlRigBlueprintFactory.h is in Public folder
+#if MCP_HAS_CONTROLRIG_FACTORY && MCP_HAS_CONTROLRIG_BLUEPRINT && ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
         FString Name = GetStringFieldAnimAuth(Params, TEXT("name"), TEXT(""));
         FString Path = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("path"), TEXT("/Game/ControlRigs")));
         FString SkeletalMeshPath = GetStringFieldAnimAuth(Params, TEXT("skeletalMeshPath"), TEXT(""));
@@ -2269,12 +2381,12 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
                 ANIM_ERROR_RESPONSE(FString::Printf(TEXT("Could not load skeletal mesh: %s"), *SkeletalMeshPath), TEXT("SKELETAL_MESH_NOT_FOUND"));
             }
             
-            // Use static factory method to create from skeletal mesh
+            // Use static factory method to create from skeletal mesh (UE 5.5+ only)
             ControlRigBP = UControlRigBlueprintFactory::CreateControlRigFromSkeletalMeshOrSkeleton(SkeletalMesh, bModularRig);
         }
         else
         {
-            // Create empty control rig at specified path
+            // Create empty control rig at specified path (UE 5.5+ only)
             ControlRigBP = UControlRigBlueprintFactory::CreateNewControlRigAsset(FullPath, bModularRig);
         }
         
@@ -2297,12 +2409,69 @@ static TSharedPtr<FJsonObject> HandleAnimationAuthoringRequest(const TSharedPtr<
         Response->SetBoolField(TEXT("modularRig"), bModularRig);
         ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Control Rig '%s' created successfully"), *Name));
 #elif MCP_HAS_CONTROLRIG_BLUEPRINT
-        // Factory not available, fall back to informative message
+        // Factory static methods not available in UE 5.1-5.4 (header is in Private folder)
+        // Use the Subsystem's CreateControlRigBlueprint method as fallback
         FString Name = GetStringFieldAnimAuth(Params, TEXT("name"), TEXT(""));
         FString Path = NormalizeAnimPath(GetStringFieldAnimAuth(Params, TEXT("path"), TEXT("/Game/ControlRigs")));
+        FString SkeletalMeshPath = GetStringFieldAnimAuth(Params, TEXT("skeletalMeshPath"), TEXT(""));
+        
+        if (Name.IsEmpty())
+        {
+            ANIM_ERROR_RESPONSE(TEXT("Name is required"), TEXT("MISSING_NAME"));
+        }
+        
         FString FullPath = Path / Name;
-        Response->SetStringField(TEXT("assetPath"), FullPath);
-        ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Control Rig '%s' creation requires ControlRigEditor module"), *Name));
+        
+        // Create Control Rig Blueprint using FKismetEditorUtilities (works in all UE 5.x versions)
+        FString FullPackageName = Path / Name;
+        
+        // Create the package
+        UPackage* Package = CreatePackage(*FullPackageName);
+        if (!Package)
+        {
+            ANIM_ERROR_RESPONSE(FString::Printf(TEXT("Failed to create package: %s"), *FullPackageName), TEXT("PACKAGE_CREATE_FAILED"));
+        }
+        
+        Package->FullyLoad();
+        
+        // Create the Control Rig Blueprint using FKismetEditorUtilities
+        UControlRigBlueprint* ControlRigBP = Cast<UControlRigBlueprint>(
+            FKismetEditorUtilities::CreateBlueprint(
+                UControlRig::StaticClass(),
+                Package,
+                *Name,
+                BPTYPE_Normal,
+                UControlRigBlueprint::StaticClass(),
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+                URigVMBlueprintGeneratedClass::StaticClass(),
+#else
+                // UE 5.0 uses UControlRigBlueprintGeneratedClass instead
+                UControlRigBlueprintGeneratedClass::StaticClass(),
+#endif
+                NAME_None));
+        
+        if (!ControlRigBP)
+        {
+            ANIM_ERROR_RESPONSE(TEXT("Failed to create Control Rig Blueprint"), TEXT("CREATION_FAILED"));
+        }
+        
+        // Set the target skeleton if provided (via skeletal mesh)
+        if (!SkeletalMeshPath.IsEmpty())
+        {
+            USkeletalMesh* SkeletalMesh = LoadSkeletalMeshFromPathAnim(SkeletalMeshPath);
+            if (SkeletalMesh && SkeletalMesh->GetSkeleton())
+            {
+                USkeletalMesh* PreviewMesh = SkeletalMesh->GetSkeleton()->GetPreviewMesh();
+                if (PreviewMesh)
+                {
+                    ControlRigBP->SetPreviewMesh(PreviewMesh);
+                }
+            }
+        }
+        
+        Response->SetStringField(TEXT("assetPath"), ControlRigBP->GetPathName());
+        Response->SetBoolField(TEXT("modularRig"), false);  // Not supported in fallback
+        ANIM_SUCCESS_RESPONSE(FString::Printf(TEXT("Control Rig '%s' created successfully (UE 5.1-5.4 compatible mode)"), *Name));
 #else
         ANIM_ERROR_RESPONSE(TEXT("Control Rig module not available"), TEXT("NOT_SUPPORTED"));
 #endif

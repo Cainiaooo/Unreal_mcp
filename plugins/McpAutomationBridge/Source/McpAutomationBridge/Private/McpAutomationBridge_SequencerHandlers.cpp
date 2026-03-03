@@ -118,14 +118,20 @@ bool UMcpAutomationBridgeSubsystem::HandleAddSequencerKeyframe(
     FFrameRate DisplayRate = MovieScene->GetDisplayRate();
     FFrameTime FrameTime = DisplayRate.AsFrameTime(TimeSeconds);
     FFrameNumber FrameNumber = FrameTime.GetFrame();
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+    // UE 5.3+: GetChannel returns mutable reference
     FMovieSceneFloatChannel& Channel = FloatSection->GetChannel();
     Channel.AddCubicKey(FrameNumber, static_cast<float>(Value));
+#else
+    // UE 5.0-5.2: GetChannel returns const reference, need to const_cast to modify
+    const FMovieSceneFloatChannel& Channel = FloatSection->GetChannel();
+    const_cast<FMovieSceneFloatChannel&>(Channel).AddCubicKey(FrameNumber, static_cast<float>(Value));
+#endif
 
     MovieScene->Modify();
 
     TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
-    Out->SetBoolField(TEXT("success"), true);
-    Out->SetStringField(TEXT("sequencePath"), SequencePath);
+    AddAssetVerification(Out, LevelSequence);
     Out->SetStringField(TEXT("bindingGuid"), BindingGuidStr);
     Out->SetStringField(TEXT("propertyName"), PropertyName);
     Out->SetNumberField(TEXT("time"), TimeSeconds);
@@ -217,8 +223,8 @@ bool UMcpAutomationBridgeSubsystem::HandleManageSequencerTrack(
     }
 
     TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+    AddAssetVerification(Out, LevelSequence);
     Out->SetBoolField(TEXT("success"), bSuccess);
-    Out->SetStringField(TEXT("sequencePath"), SequencePath);
     Out->SetStringField(TEXT("bindingGuid"), BindingGuidStr);
     Out->SetStringField(TEXT("propertyName"), PropertyName);
     Out->SetStringField(TEXT("op"), Op);
@@ -327,8 +333,8 @@ bool UMcpAutomationBridgeSubsystem::HandleAddCameraTrack(
     }
 
     TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+    AddAssetVerification(Resp, LevelSequence);
     Resp->SetBoolField(TEXT("success"), true);
-    Resp->SetStringField(TEXT("sequencePath"), SequencePath);
     Resp->SetStringField(TEXT("cameraActorPath"), CameraActorPath);
     Resp->SetNumberField(TEXT("startTime"), StartTime);
     Resp->SetNumberField(TEXT("endTime"), EndTime);
@@ -429,8 +435,8 @@ bool UMcpAutomationBridgeSubsystem::HandleAddAnimationTrack(
     }
 
     TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+    AddAssetVerification(Resp, LevelSequence);
     Resp->SetBoolField(TEXT("success"), true);
-    Resp->SetStringField(TEXT("sequencePath"), SequencePath);
     Resp->SetStringField(TEXT("bindingGuid"), BindingGuidStr);
     Resp->SetStringField(TEXT("animSequencePath"), AnimSequencePath);
     Resp->SetNumberField(TEXT("startTime"), StartTime);
@@ -506,8 +512,8 @@ bool UMcpAutomationBridgeSubsystem::HandleAddTransformTrack(
     }
 
     TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+    AddAssetVerification(Resp, LevelSequence);
     Resp->SetBoolField(TEXT("success"), true);
-    Resp->SetStringField(TEXT("sequencePath"), SequencePath);
     Resp->SetStringField(TEXT("bindingGuid"), BindingGuidStr);
     Resp->SetBoolField(TEXT("hasDefaultKeyframes"), true);
 

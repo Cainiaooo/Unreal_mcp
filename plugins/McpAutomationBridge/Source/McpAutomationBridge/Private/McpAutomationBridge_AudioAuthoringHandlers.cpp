@@ -128,33 +128,15 @@
 #include "MetasoundFrontendDocumentBuilder.h"
 #include "MetasoundFrontendDocument.h"
 #define MCP_HAS_METASOUND_FRONTEND 1
+// UE 5.5+ has 3-arg constructor and FinishBuilding method
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+#define MCP_HAS_METASOUND_FRONTEND_V2 1
+#else
+#define MCP_HAS_METASOUND_FRONTEND_V2 0
+#endif
 #else
 #define MCP_HAS_METASOUND_FRONTEND 0
-#endif
-
-// MetaSound Factory (Editor)
-#if __has_include("MetasoundFactory.h")
-#include "MetasoundFactory.h"
-#define MCP_HAS_METASOUND_FACTORY 1
-#else
-#define MCP_HAS_METASOUND_FACTORY 0
-#endif
-
-// MetaSound Editor Subsystem
-#if __has_include("MetasoundEditorSubsystem.h")
-#include "MetasoundEditorSubsystem.h"
-#define MCP_HAS_METASOUND_EDITOR 1
-#else
-#define MCP_HAS_METASOUND_EDITOR 0
-#endif
-
-// MetaSound Frontend Document Builder (UE 5.3+)
-#if __has_include("MetasoundFrontendDocumentBuilder.h")
-#include "MetasoundFrontendDocumentBuilder.h"
-#include "MetasoundFrontendDocument.h"
-#define MCP_HAS_METASOUND_FRONTEND 1
-#else
-#define MCP_HAS_METASOUND_FRONTEND 0
+#define MCP_HAS_METASOUND_FRONTEND_V2 0
 #endif
 
 // MetaSound Factory (Editor)
@@ -192,11 +174,32 @@ namespace {
 #define GetBoolFieldAudioAuth GetJsonBoolField
 #define GetStringFieldAudioAuth GetJsonStringField
 
-// Helper to normalize asset path
+// Helper to normalize asset path with security validation
 static FString NormalizeAudioPath(const FString& Path)
 {
-    FString Normalized = Path;
-    Normalized.ReplaceInline(TEXT("/Content"), TEXT("/Game"));
+    // SECURITY: First validate path for traversal attacks
+    FString Sanitized = SanitizeProjectRelativePath(Path);
+    if (Sanitized.IsEmpty() && !Path.IsEmpty())
+    {
+        // Path was rejected due to traversal or invalid characters
+        UE_LOG(LogMcpAutomationBridgeSubsystem, Warning, 
+            TEXT("NormalizeAudioPath: Rejected malicious path: %s"), *Path);
+        return FString();
+    }
+    
+    FString Normalized = Sanitized;
+    
+    // Only replace /Content at the start to avoid corrupting plugin paths
+    // Plugin paths like /MyPlugin/Content/Audio should NOT become /MyPlugin/Game/Audio
+    if (Normalized.StartsWith(TEXT("/Content/")))
+    {
+        Normalized = TEXT("/Game/") + Normalized.Mid(9);  // Skip "/Content/"
+    }
+    else if (Normalized == TEXT("/Content"))
+    {
+        Normalized = TEXT("/Game");
+    }
+    
     Normalized.ReplaceInline(TEXT("\\"), TEXT("/"));
     
     // Remove trailing slashes
@@ -344,6 +347,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         FString FullPath = NewCue->GetPathName();
         Response->SetStringField(TEXT("assetPath"), FullPath);
         AUDIO_SUCCESS_RESPONSE(FString::Printf(TEXT("SoundCue '%s' created"), *Name));
+        AddAssetVerification(Response, NewCue);
         return Response;
     }
     
@@ -445,6 +449,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         
         Response->SetStringField(TEXT("nodeId"), NewNode->GetName());
         AUDIO_SUCCESS_RESPONSE(FString::Printf(TEXT("Node '%s' added to SoundCue"), *NodeType));
+        AddAssetVerification(Response, Cue);
         return Response;
     }
     
@@ -498,6 +503,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(Cue, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Nodes connected"));
+        AddAssetVerification(Response, Cue);
         return Response;
     }
     
@@ -529,6 +535,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(Cue, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Attenuation settings updated"));
+        AddAssetVerification(Response, Cue);
         return Response;
     }
     
@@ -562,6 +569,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(Cue, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Concurrency settings updated"));
+        AddAssetVerification(Response, Cue);
         return Response;
     }
     
@@ -606,6 +614,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         Response->SetStringField(TEXT("assetPath"), FullPath);
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("MetaSound '%s' created"), *Name));
+        AddAssetVerification(Response, MetaSound);
         return Response;
 #elif MCP_HAS_METASOUND
         // MetaSound available but no factory - create basic asset
@@ -637,6 +646,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         Response->SetStringField(TEXT("assetPath"), FullPath);
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("MetaSound '%s' created"), *Name));
+        AddAssetVerification(Response, MetaSound);
         return Response;
 #else
         AUDIO_ERROR_RESPONSE(TEXT("MetaSound support not available in this engine version"), TEXT("METASOUND_NOT_AVAILABLE"));
@@ -673,7 +683,11 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         
         // Create a builder for this MetaSound
         TScriptInterface<IMetaSoundDocumentInterface> ScriptInterface(MetaSound);
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface, nullptr, true);
+#else
+        FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface);
+#endif
         
         // Determine node class name from nodeType if not explicitly provided
         FString ActualClassName = NodeClassName;
@@ -721,6 +735,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetStringField(TEXT("nodeClassName"), ActualClassName);
             Response->SetBoolField(TEXT("success"), true);
             Response->SetStringField(TEXT("message"), FString::Printf(TEXT("MetaSound node '%s' added"), *ActualClassName));
+            AddAssetVerification(Response, MetaSound);
         }
         else
         {
@@ -730,7 +745,9 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetStringField(TEXT("errorCode"), TEXT("NODE_CLASS_NOT_FOUND"));
         }
         
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         Builder.FinishBuilding();
+#endif
         return Response;
 #elif MCP_HAS_METASOUND
         // FIX: Return error when MetaSound Frontend Builder not available
@@ -772,7 +789,11 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         
         // Use the Frontend Document Builder API
         TScriptInterface<IMetaSoundDocumentInterface> ScriptInterface(MetaSound);
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface, nullptr, true);
+#else
+        FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface);
+#endif
         
         // Parse node IDs
         FGuid SourceGuid, TargetGuid;
@@ -802,6 +823,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetBoolField(TEXT("success"), true);
             Response->SetStringField(TEXT("message"), TEXT("MetaSound nodes connected"));
             Response->SetNumberField(TEXT("edgesCreated"), CreatedEdges.Num());
+            AddAssetVerification(Response, MetaSound);
         }
         else
         {
@@ -810,7 +832,9 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetStringField(TEXT("errorCode"), TEXT("EDGE_FAILED"));
         }
         
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         Builder.FinishBuilding();
+#endif
         return Response;
 #elif MCP_HAS_METASOUND
         // FIX: Return error when MetaSound Frontend Builder not available
@@ -853,7 +877,11 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         
         // Use the Frontend Document Builder API
         TScriptInterface<IMetaSoundDocumentInterface> ScriptInterface(MetaSound);
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface, nullptr, true);
+#else
+        FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface);
+#endif
         
         // Create the graph input
         FMetasoundFrontendClassInput ClassInput;
@@ -874,6 +902,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetStringField(TEXT("nodeId"), InputNode->GetID().ToString());
             Response->SetBoolField(TEXT("success"), true);
             Response->SetStringField(TEXT("message"), FString::Printf(TEXT("MetaSound input '%s' added"), *InputName));
+            AddAssetVerification(Response, MetaSound);
         }
         else
         {
@@ -882,7 +911,9 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetStringField(TEXT("errorCode"), TEXT("INPUT_FAILED"));
         }
         
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         Builder.FinishBuilding();
+#endif
         return Response;
 #elif MCP_HAS_METASOUND
         FString AssetPath = NormalizeAudioPath(GetStringFieldAudioAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -928,7 +959,11 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         
         // Use the Frontend Document Builder API
         TScriptInterface<IMetaSoundDocumentInterface> ScriptInterface(MetaSound);
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface, nullptr, true);
+#else
+        FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface);
+#endif
         
         // Create the graph output
         FMetasoundFrontendClassOutput ClassOutput;
@@ -949,6 +984,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetStringField(TEXT("nodeId"), OutputNode->GetID().ToString());
             Response->SetBoolField(TEXT("success"), true);
             Response->SetStringField(TEXT("message"), FString::Printf(TEXT("MetaSound output '%s' added"), *OutputName));
+            AddAssetVerification(Response, MetaSound);
         }
         else
         {
@@ -957,7 +993,9 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetStringField(TEXT("errorCode"), TEXT("OUTPUT_FAILED"));
         }
         
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         Builder.FinishBuilding();
+#endif
         return Response;
 #elif MCP_HAS_METASOUND
         FString AssetPath = NormalizeAudioPath(GetStringFieldAudioAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -1002,7 +1040,11 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         
         // Use the Frontend Document Builder API
         TScriptInterface<IMetaSoundDocumentInterface> ScriptInterface(MetaSound);
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface, nullptr, true);
+#else
+        FMetaSoundFrontendDocumentBuilder Builder(ScriptInterface);
+#endif
         
         // Create the literal value based on provided parameters
         FMetasoundFrontendLiteral Literal;
@@ -1042,6 +1084,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             
             Response->SetBoolField(TEXT("success"), true);
             Response->SetStringField(TEXT("message"), FString::Printf(TEXT("MetaSound default for '%s' set"), *InputName));
+            AddAssetVerification(Response, MetaSound);
         }
         else
         {
@@ -1050,7 +1093,9 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetStringField(TEXT("errorCode"), TEXT("SET_DEFAULT_FAILED"));
         }
         
+        #if MCP_HAS_METASOUND_FRONTEND_V2
         Builder.FinishBuilding();
+#endif
         return Response;
 #elif MCP_HAS_METASOUND
         FString AssetPath = NormalizeAudioPath(GetStringFieldAudioAuth(Params, TEXT("assetPath"), TEXT("")));
@@ -1103,6 +1148,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         FString FullPath = NewClass->GetPathName();
         Response->SetStringField(TEXT("assetPath"), FullPath);
         AUDIO_SUCCESS_RESPONSE(FString::Printf(TEXT("SoundClass '%s' created"), *Name));
+        AddAssetVerification(Response, NewClass);
         return Response;
     }
     
@@ -1142,6 +1188,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(SoundClass, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Sound class properties updated"));
+        AddAssetVerification(Response, SoundClass);
         return Response;
     }
     
@@ -1173,6 +1220,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(SoundClass, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Sound class parent updated"));
+        AddAssetVerification(Response, SoundClass);
         return Response;
     }
     
@@ -1210,6 +1258,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         FString FullPath = NewMix->GetPathName();
         Response->SetStringField(TEXT("assetPath"), FullPath);
         AUDIO_SUCCESS_RESPONSE(FString::Printf(TEXT("SoundMix '%s' created"), *Name));
+        AddAssetVerification(Response, NewMix);
         return Response;
     }
     
@@ -1249,6 +1298,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(Mix, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Mix modifier added"));
+        AddAssetVerification(Response, Mix);
         return Response;
     }
     
@@ -1409,6 +1459,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         Response->SetObjectField(TEXT("eqSettings"), EQInfo);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Mix EQ configured"));
+        AddAssetVerification(Response, Mix);
         return Response;
     }
     
@@ -1458,6 +1509,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         FString FullPath = NewAtten->GetPathName();
         Response->SetStringField(TEXT("assetPath"), FullPath);
         AUDIO_SUCCESS_RESPONSE(FString::Printf(TEXT("SoundAttenuation '%s' created"), *Name));
+        AddAssetVerification(Response, NewAtten);
         return Response;
     }
     
@@ -1503,6 +1555,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(Atten, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Distance attenuation configured"));
+        AddAssetVerification(Response, Atten);
         return Response;
     }
     
@@ -1536,6 +1589,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(Atten, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Spatialization configured"));
+        AddAssetVerification(Response, Atten);
         return Response;
     }
     
@@ -1569,6 +1623,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(Atten, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Occlusion configured"));
+        AddAssetVerification(Response, Atten);
         return Response;
     }
     
@@ -1606,6 +1661,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         SaveAudioAsset(Atten, bSave);
         
         AUDIO_SUCCESS_RESPONSE(TEXT("Reverb send configured"));
+        AddAssetVerification(Response, Atten);
         return Response;
     }
     
@@ -1672,6 +1728,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         FString FullPath = NewVoice->GetPathName();
         Response->SetStringField(TEXT("assetPath"), FullPath);
         AUDIO_SUCCESS_RESPONSE(FString::Printf(TEXT("DialogueVoice '%s' created"), *Name));
+        AddAssetVerification(Response, NewVoice);
         return Response;
 #else
         AUDIO_ERROR_RESPONSE(TEXT("Dialogue system not available"), TEXT("DIALOGUE_NOT_AVAILABLE"));
@@ -1716,6 +1773,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         FString FullPath = NewWave->GetPathName();
         Response->SetStringField(TEXT("assetPath"), FullPath);
         AUDIO_SUCCESS_RESPONSE(FString::Printf(TEXT("DialogueWave '%s' created"), *Name));
+        AddAssetVerification(Response, NewWave);
         return Response;
 #else
         AUDIO_ERROR_RESPONSE(TEXT("Dialogue system not available"), TEXT("DIALOGUE_NOT_AVAILABLE"));
@@ -1817,6 +1875,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         
         Response->SetNumberField(TEXT("contextCount"), Wave->ContextMappings.Num());
         AUDIO_SUCCESS_RESPONSE(TEXT("Dialogue context mapping added"));
+        AddAssetVerification(Response, Wave);
         return Response;
 #else
         AUDIO_ERROR_RESPONSE(TEXT("Dialogue system not available"), TEXT("DIALOGUE_NOT_AVAILABLE"));
@@ -1883,6 +1942,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         FString FullPath = NewEffect->GetPathName();
         Response->SetStringField(TEXT("assetPath"), FullPath);
         AUDIO_SUCCESS_RESPONSE(FString::Printf(TEXT("ReverbEffect '%s' created"), *Name));
+        AddAssetVerification(Response, NewEffect);
         return Response;
 #else
         AUDIO_ERROR_RESPONSE(TEXT("Reverb effect not available"), TEXT("REVERB_NOT_AVAILABLE"));
@@ -1924,6 +1984,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         Response->SetStringField(TEXT("assetPath"), FullPath);
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("Source effect chain '%s' created"), *Name));
+        AddAssetVerification(Response, NewChain);
         return Response;
 #else
         // Fallback: create a basic container but note that full effect chain requires AudioMixer
@@ -1985,6 +2046,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
             Response->SetNumberField(TEXT("effectCount"), Chain->Chain.Num());
             Response->SetBoolField(TEXT("success"), true);
             Response->SetStringField(TEXT("message"), TEXT("Source effect added to chain"));
+            AddAssetVerification(Response, Chain);
         }
         else
         {
@@ -2047,6 +2109,7 @@ static TSharedPtr<FJsonObject> HandleAudioAuthoringRequest(const TSharedPtr<FJso
         Response->SetStringField(TEXT("assetPath"), FullPath);
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("Submix '%s' created"), *Name));
+        AddAssetVerification(Response, NewSubmix);
         return Response;
 #else
         FString Name = GetStringFieldAudioAuth(Params, TEXT("name"), TEXT(""));

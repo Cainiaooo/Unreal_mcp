@@ -65,8 +65,13 @@ static void SetBPVarDefaultValueGF(UBlueprint* Blueprint, FName VarName, const F
             if (Property)
             {
                 void* ValuePtr = Property->ContainerPtrToValuePtr<void>(CDO);
-                // UE 5.6+: Use ImportText_Direct instead of deprecated ImportText
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
+                // UE 5.1+: Use ImportText_Direct
                 Property->ImportText_Direct(*DefaultValue, ValuePtr, CDO, 0);
+#else
+                // UE 5.0: Use ImportText with different signature
+                Property->ImportText(*DefaultValue, ValuePtr, PPF_None, CDO);
+#endif
                 Blueprint->MarkPackageDirty();
             }
         }
@@ -412,11 +417,39 @@ bool UMcpAutomationBridgeSubsystem::HandleManageGameFrameworkAction(
     FString Path = GetStringField(Payload, TEXT("path"), TEXT("/Game"));
     bool bSave = GetBoolField(Payload, TEXT("save"), false);
     
+    // SECURITY: Validate path to prevent traversal attacks
+    FString SanitizedPath = SanitizeProjectRelativePath(Path);
+    if (SanitizedPath.IsEmpty() && !Path.IsEmpty())
+    {
+        SendAutomationError(RequestingSocket, RequestId, 
+            TEXT("Invalid path: path traversal or invalid characters detected. Path must start with /Game/, /Engine/, or /Script/"), 
+            TEXT("SECURITY_VIOLATION"));
+        return true;
+    }
+    if (!SanitizedPath.IsEmpty())
+    {
+        Path = SanitizedPath;
+    }
+    
     // Support both gameModeBlueprint and blueprintPath as aliases
     FString GameModeBlueprint = GetStringField(Payload, TEXT("gameModeBlueprint"));
     if (GameModeBlueprint.IsEmpty())
     {
         GameModeBlueprint = GetStringField(Payload, TEXT("blueprintPath"));
+    }
+    
+    // SECURITY: Validate blueprint paths
+    if (!GameModeBlueprint.IsEmpty())
+    {
+        FString SanitizedBPPath = SanitizeProjectRelativePath(GameModeBlueprint);
+        if (SanitizedBPPath.IsEmpty())
+        {
+            SendAutomationError(RequestingSocket, RequestId, 
+                TEXT("Invalid gameModeBlueprint path: path traversal or invalid characters detected"), 
+                TEXT("SECURITY_VIOLATION"));
+            return true;
+        }
+        GameModeBlueprint = SanitizedBPPath;
     }
     FString BlueprintPath = GameModeBlueprint; // Keep in sync for configure_player_start
 
@@ -479,6 +512,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageGameFrameworkAction(
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("Created GameMode blueprint: %s"), *Name));
         Response->SetStringField(TEXT("blueprintPath"), BP->GetPathName());
+        AddAssetVerification(Response, BP);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Success"), Response);
         return true;
     }
@@ -516,6 +550,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageGameFrameworkAction(
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("Created GameState blueprint: %s"), *Name));
         Response->SetStringField(TEXT("blueprintPath"), BP->GetPathName());
+        AddAssetVerification(Response, BP);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Success"), Response);
         return true;
     }
@@ -553,6 +588,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageGameFrameworkAction(
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("Created PlayerController blueprint: %s"), *Name));
         Response->SetStringField(TEXT("blueprintPath"), BP->GetPathName());
+        AddAssetVerification(Response, BP);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Success"), Response);
         return true;
     }
@@ -590,6 +626,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageGameFrameworkAction(
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("Created PlayerState blueprint: %s"), *Name));
         Response->SetStringField(TEXT("blueprintPath"), BP->GetPathName());
+        AddAssetVerification(Response, BP);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Success"), Response);
         return true;
     }
@@ -627,6 +664,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageGameFrameworkAction(
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("Created GameInstance blueprint: %s"), *Name));
         Response->SetStringField(TEXT("blueprintPath"), BP->GetPathName());
+        AddAssetVerification(Response, BP);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Success"), Response);
         return true;
     }
@@ -664,6 +702,7 @@ bool UMcpAutomationBridgeSubsystem::HandleManageGameFrameworkAction(
         Response->SetBoolField(TEXT("success"), true);
         Response->SetStringField(TEXT("message"), FString::Printf(TEXT("Created HUD blueprint: %s"), *Name));
         Response->SetStringField(TEXT("blueprintPath"), BP->GetPathName());
+        AddAssetVerification(Response, BP);
         SendAutomationResponse(RequestingSocket, RequestId, true, TEXT("Success"), Response);
         return true;
     }
